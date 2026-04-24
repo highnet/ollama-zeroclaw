@@ -1,0 +1,8 @@
+.openclaw-home/
+.zeroclaw-home/
+.runtime/
+logs/
+*.log
+*.pid
+.env
+node_modules/
