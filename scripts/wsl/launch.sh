@@ -3,15 +3,17 @@ set -u
 # Launcher script for the Textual TUI — called by start.ps1 via wt.exe.
 # Using a script file avoids wt.exe treating ';' as a pane separator.
 
-# On any exit (normal, crash, Ctrl-C) print the exit code.
-# The outer "bash -c" wrapper in start.ps1 runs "exec bash -l" afterwards
-# to keep the wt.exe tab open regardless.
-trap 'echo; echo "--- TUI exited (code $?) ---"' EXIT
+# On any exit (normal, crash, Ctrl-C) print the real exit code.
+# The outer wrapper keeps the terminal open afterwards.
+trap 'rc=$?; echo; echo "--- TUI exited (code $rc) ---"' EXIT
 
-# Source login profile so PATH etc. are set up correctly
+# Source login files with nounset disabled because distro/user profiles often
+# assume interactive shells and may reference unset variables.
+set +u
 source /etc/profile 2>/dev/null || true
 [ -f /home/joaquin/.profile ] && source /home/joaquin/.profile 2>/dev/null || true
 [ -f /home/joaquin/.bashrc ]  && source /home/joaquin/.bashrc  2>/dev/null || true
+set -u
 
 # Source cargo env (zeroclaw / rustup)
 source /home/joaquin/.cargo/env 2>/dev/null || true
@@ -26,9 +28,7 @@ cd "$REPO" || {
     echo "Failed to cd to repo: $REPO" >&2
     exit 1
 }
-ONBOARD_REQUEST_FILE="$REPO/.runtime/request_interactive_onboard"
-
-rm -f "$ONBOARD_REQUEST_FILE"
+CRASH_LOG="$REPO/logs/control_tui_crash.log"
 
 # Reset terminal in case a previous crashed TUI left it in raw mode
 reset 2>/dev/null || tput reset 2>/dev/null || true
@@ -46,37 +46,25 @@ else
     reset 2>/dev/null || tput reset 2>/dev/null || true
 fi
 
-while true; do
-    # Launch Textual TUI. If it requests interactive onboarding, exit back to
-    # the shell, run zeroclaw onboard with full terminal ownership, then restart.
-    python3.12 "$REPO/scripts/wsl/control_tui.py"
-    tui_status=$?
+crash_log_size=0
+if [[ -f "$CRASH_LOG" ]]; then
+    crash_log_size=$(wc -c < "$CRASH_LOG")
+fi
 
-    if [[ ! -f "$ONBOARD_REQUEST_FILE" ]]; then
-        exit "$tui_status"
+python3.12 "$REPO/scripts/wsl/control_tui.py"
+tui_status=$?
+crash_logged=0
+if [[ -f "$CRASH_LOG" ]]; then
+    current_crash_log_size=$(wc -c < "$CRASH_LOG")
+    if (( current_crash_log_size > crash_log_size )); then
+        crash_logged=1
     fi
+fi
 
-    rm -f "$ONBOARD_REQUEST_FILE"
-    reset 2>/dev/null || tput reset 2>/dev/null || true
+if [[ "$tui_status" -eq 1 && "$crash_logged" -eq 0 ]]; then
+    # Textual occasionally returns 1 on a normal terminal teardown even
+    # though the app did not crash. Keep actual logged failures nonzero.
+    exit 0
+fi
 
-    echo
-    echo "============================================================"
-    echo "  ZeroClaw Interactive Onboarding"
-    echo "  Configure Telegram and any other integrations here."
-    echo "============================================================"
-    echo
-
-    zeroclaw onboard --config-dir "$REPO/.zeroclaw-home"
-    onboard_status=$?
-
-    echo
-    if [[ "$onboard_status" -eq 0 ]]; then
-        echo "[OK] zeroclaw onboard completed"
-    else
-        echo "[FAILED] zeroclaw onboard exited $onboard_status"
-    fi
-    echo "Re-applying config patch and starting services..."
-
-    "$REPO/scripts/wsl/setup.sh" || true
-    reset 2>/dev/null || tput reset 2>/dev/null || true
-done
+exit "$tui_status"

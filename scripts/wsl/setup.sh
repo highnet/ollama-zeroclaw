@@ -35,6 +35,39 @@ require_cmd() {
     fi
 }
 
+find_zeroclaw_web_dir() {
+    local version
+    version="$(zeroclaw --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+    if [[ -z "$version" ]]; then
+        return 1
+    fi
+
+    find "$HOME/.cargo/registry/src" -type f -path "*/zeroclaw-$version/web/package.json" -print -quit 2>/dev/null \
+        | sed 's#/package.json$##'
+}
+
+build_gateway_dashboard() {
+    local web_dir
+
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "Skipping dashboard build: npm is not installed in WSL."
+        return 0
+    fi
+
+    web_dir="$(find_zeroclaw_web_dir || true)"
+    if [[ -z "$web_dir" ]]; then
+        echo "Skipping dashboard build: could not locate zeroclaw web sources under ~/.cargo/registry/src."
+        return 0
+    fi
+
+    echo "Building ZeroClaw web dashboard from $web_dir"
+    if [[ -f "$web_dir/package-lock.json" ]]; then
+        (cd "$web_dir" && npm ci && npm run build)
+    else
+        (cd "$web_dir" && npm install && npm run build)
+    fi
+}
+
 ensure_zeroclaw_token() {
     local token
     token="$(read_zeroclaw_token || true)"
@@ -191,6 +224,8 @@ else
     fi
 fi
 
+build_gateway_dashboard
+
 # Ensure zeroclaw config exists with correct gateway port, pairing=false, sandbox=none
 if [[ ! -f "$ZEROCLAW_CONFIG_PATH" ]]; then
     zeroclaw onboard --quick --force \
@@ -204,6 +239,22 @@ p = pathlib.Path(r"$ZEROCLAW_CONFIG_PATH")
 if not p.exists():
     raise SystemExit(0)
 txt = p.read_text()
+legacy_channels = re.search(r'(?ms)^\[channels\]\n(.*?)(?=^\[|\Z)', txt)
+if legacy_channels:
+    legacy_body = legacy_channels.group(1)
+    cli_match = re.search(r'^cli\s*=\s*(true|false)\s*$', legacy_body, re.MULTILINE)
+    timeout_match = re.search(r'^message_timeout_secs\s*=\s*(\d+)\s*$', legacy_body, re.MULTILINE)
+    cli_value = cli_match.group(1) if cli_match else 'true'
+    timeout_value = timeout_match.group(1) if timeout_match else '300'
+    channels_config_block = (
+        '[channels_config]\n'
+        f'cli = {cli_value}\n'
+        f'message_timeout_secs = {timeout_value}\n'
+    )
+    if re.search(r'(?m)^\[channels_config\]\s*$', txt):
+        txt = re.sub(r'(?ms)^\[channels_config\]\n.*?(?=^\[|\Z)', channels_config_block, txt, count=1)
+    else:
+        txt = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', channels_config_block, txt, count=1)
 # Insert/update [gateway] section port
 if '[gateway]' not in txt:
     txt += '\n[gateway]\nport = $ZEROCLAW_PORT\nrequire_pairing = false\n'
@@ -214,7 +265,7 @@ else:
 txt = re.sub(r'(\[security\.sandbox\][^\[]*?backend\s*=\s*)"[^"]+"',
              r'\1"none"', txt, flags=re.DOTALL)
 p.write_text(txt)
-print("Config patched: gateway=$ZEROCLAW_PORT pairing=false sandbox=none")
+print("Config patched: gateway=$ZEROCLAW_PORT pairing=false sandbox=none channels_schema=current")
 PYEOF
 
 # Start ZeroClaw daemon (only if zeroclaw is installed in WSL)
@@ -223,7 +274,7 @@ if command -v zeroclaw >/dev/null 2>&1; then
         "zeroclaw" \
         "$RUNTIME_DIR/zeroclaw.pid" \
         "$LOG_DIR/zeroclaw.log" \
-        zeroclaw daemon --host 0.0.0.0 --port "$ZEROCLAW_PORT"
+        zeroclaw daemon --config-dir "$ZEROCLAW_HOME_DIR" --host 0.0.0.0 --port "$ZEROCLAW_PORT"
 else
     echo "zeroclaw command not found in WSL. Skipping ZeroClaw daemon start."
     echo "Install ZeroClaw in WSL and re-run scripts/wsl/setup.sh to start the daemon."

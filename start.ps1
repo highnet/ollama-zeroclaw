@@ -64,7 +64,11 @@ if (Test-Path $ollamaExe) {
 }
 
 $wtCmd = Get-Command wt.exe -ErrorAction SilentlyContinue
-if ($wtCmd) {
+
+$runInline = $env:TERM_PROGRAM -eq 'vscode' -or $Host.Name -match 'Visual Studio Code|ConsoleHost'
+if ($runInline) {
+    & wsl.exe -d $distro -- bash $launchScript
+} elseif ($wtCmd) {
     Start-Process wt.exe -ArgumentList @(
         '--window', 'new',
         'wsl.exe', '-d', $distro, '--',

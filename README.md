@@ -47,6 +47,8 @@ Inside WSL2, the setup script will install if missing:
 - `zeroclaw` CLI
 - `ollama`
 
+During setup, the WSL script also rebuilds the ZeroClaw web dashboard from the installed `zeroclaw` source package when those web sources are available.
+
 ## Quick start
 
 From this repository in PowerShell:
@@ -58,6 +60,10 @@ From this repository in PowerShell:
 ```
 
 Then a new terminal window will open with the ZeroClaw TUI running.
+
+On Windows Explorer, you can also double-click `start.bat` to launch the same startup flow without opening PowerShell first.
+
+The gateway dashboard is served at `http://localhost:18789/`, and the TUI dashboard now includes an `Open Browser UI` button that opens that URL in your browser.
 
 ## Change the model
 

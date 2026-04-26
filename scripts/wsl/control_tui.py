@@ -13,6 +13,8 @@ import shutil
 import socket
 import subprocess
 import threading
+import tomllib
+import traceback
 import time
 from pathlib import Path
 
@@ -26,7 +28,6 @@ ENV_FILE = REPO_ROOT / ".env"
 RUNTIME_DIR = REPO_ROOT / ".runtime"
 LOG_DIR = REPO_ROOT / "logs"
 SESSION_FILE = RUNTIME_DIR / "session.json"
-ONBOARD_REQUEST_FILE = RUNTIME_DIR / "request_interactive_onboard"
 CARGO_ENV = Path("/home") / os.environ.get("USER", "joaquin") / ".cargo" / "env"
 
 ZEROCLAW_PORT = int(os.environ.get("ZEROCLAW_PORT", "18789"))
@@ -51,12 +52,159 @@ def get_env() -> dict:
     # Point Ollama clients at the GPU-accelerated Windows Ollama instance.
     # WSL2 mirrored networking exposes Windows localhost into WSL unchanged.
     env.setdefault("OLLAMA_HOST", "http://localhost:11434")
+    env.setdefault("ZEROCLAW_HOME", str(ZEROCLAW_HOME))
+    env.setdefault("ZEROCLAW_CONFIG_DIR", str(ZEROCLAW_HOME))
     return env
 
 
 def get_model() -> str:
     env = get_env()
     return env.get("ZEROCLAW_MODEL", DEFAULT_MODEL)
+
+
+def load_env_file() -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not ENV_FILE.exists():
+        return env
+    for line in ENV_FILE.read_text().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key, value = stripped.split("=", 1)
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
+def save_env_updates(updates: dict[str, str | None]) -> None:
+    existing_lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
+    output_lines: list[str] = []
+    seen: set[str] = set()
+
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in line:
+            key, _, _ = line.partition("=")
+            key = key.strip()
+            if key in updates:
+                seen.add(key)
+                value = updates[key]
+                if value is not None and value != "":
+                    output_lines.append(f"{key}={value}")
+            else:
+                output_lines.append(line)
+        else:
+            output_lines.append(line)
+
+    for key, value in updates.items():
+        if key not in seen and value is not None and value != "":
+            output_lines.append(f"{key}={value}")
+
+    ENV_FILE.write_text("\n".join(output_lines).rstrip() + "\n")
+
+
+def load_zeroclaw_config() -> dict:
+    config = ZEROCLAW_HOME / "config.toml"
+    if not config.exists():
+        return {}
+    return tomllib.loads(config.read_text())
+
+
+def normalize_identity(value: str) -> str:
+    return value.strip().lstrip("@")
+
+
+def parse_allowed_users(raw: str) -> list[str]:
+    candidates = [normalize_identity(item) for item in raw.split(",")]
+    values = [item for item in candidates if item]
+    return values or ["*"]
+
+
+def get_telegram_settings() -> dict[str, str | bool]:
+    config = load_zeroclaw_config()
+    telegram = config.get("channels_config", {}).get("telegram", {})
+    env = load_env_file()
+    allowed_users = telegram.get("allowed_users", ["*"])
+    if isinstance(allowed_users, str):
+        allowed_users = [allowed_users]
+    return {
+        "bot_token": telegram.get("bot_token", ""),
+        "allowed_users": ", ".join(allowed_users) if allowed_users else "*",
+        "bind_identity": env.get("ZEROCLAW_TELEGRAM_IDENTITY", ""),
+        "mention_only": bool(telegram.get("mention_only", False)),
+        "interrupt_on_new_message": bool(telegram.get("interrupt_on_new_message", False)),
+    }
+
+
+def _format_toml_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _format_toml_list(values: list[str]) -> str:
+    return "[" + ", ".join(json.dumps(item) for item in values) + "]"
+
+
+def upsert_toml_section(text: str, section: str, body_lines: list[str]) -> str:
+    block = f"[{section}]\n" + "\n".join(body_lines).rstrip() + "\n"
+    pattern = rf"(?ms)^\[{re.escape(section)}\]\n.*?(?=^\[|\Z)"
+    if re.search(pattern, text):
+        return re.sub(pattern, block, text)
+    return text.rstrip() + "\n\n" + block
+
+
+def configure_telegram_channel(bot_token: str, allowed_users_raw: str,
+                               bind_identity: str = "",
+                               mention_only: bool = False,
+                               interrupt_on_new_message: bool = False) -> None:
+    ensure_zeroclaw_config()
+    config = ZEROCLAW_HOME / "config.toml"
+    text = config.read_text() if config.exists() else ""
+    allowed_users = parse_allowed_users(allowed_users_raw)
+    text = upsert_toml_section(text, "channels_config.telegram", [
+        f"bot_token = {json.dumps(bot_token.strip())}",
+        f"allowed_users = {_format_toml_list(allowed_users)}",
+        'stream_mode = "off"',
+        f"mention_only = {_format_toml_bool(mention_only)}",
+        f"interrupt_on_new_message = {_format_toml_bool(interrupt_on_new_message)}",
+    ])
+    config.write_text(text)
+    save_env_updates({
+        "ZEROCLAW_TELEGRAM_IDENTITY": normalize_identity(bind_identity) or None,
+    })
+
+
+def bind_telegram_identity(identity: str) -> tuple[bool, str]:
+    normalized = normalize_identity(identity)
+    if not normalized:
+        return True, "Telegram identity binding skipped"
+    result = run([
+        "zeroclaw",
+        "--config-dir", str(ZEROCLAW_HOME),
+        "channel", "bind-telegram", normalized,
+    ])
+    if result.returncode == 0:
+        output = (result.stdout or "").strip()
+        return True, output or f"Bound Telegram identity {normalized}"
+    detail = ((result.stderr or result.stdout) or "Failed to bind Telegram identity").strip()
+    return False, detail[:400]
+
+
+def has_telegram_channel() -> bool:
+    telegram = load_zeroclaw_config().get("channels_config", {}).get("telegram", {})
+    return bool(telegram.get("bot_token"))
+
+
+def configure_telegram_channel_and_bind(bot_token: str, allowed_users_raw: str,
+                                        bind_identity: str = "") -> tuple[bool, str]:
+    configure_telegram_channel(bot_token, allowed_users_raw, bind_identity)
+    stop_daemon()
+    ok, message = start_daemon()
+    if not ok:
+        return False, message
+    bind_ok, bind_message = bind_telegram_identity(bind_identity)
+    if not bind_ok:
+        return False, bind_message
+    if normalize_identity(bind_identity):
+        return True, f"Telegram channel configured and bound to {normalize_identity(bind_identity)}"
+    return True, "Telegram channel configured"
 
 
 def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
@@ -219,6 +367,22 @@ def pull_model() -> tuple[bool, str]:
     return False, r.stderr[:200]
 
 
+def open_gateway_dashboard() -> tuple[bool, str]:
+    url = f"http://127.0.0.1:{ZEROCLAW_PORT}/"
+    windows_open = run_windows_powershell(f"Start-Process '{url}'")
+    if windows_open.returncode == 0:
+        return True, f"Opened browser dashboard at {url}"
+
+    xdg_open = shutil.which("xdg-open")
+    if xdg_open:
+        opened = subprocess.run([xdg_open, url], capture_output=True, text=True)
+        if opened.returncode == 0:
+            return True, f"Opened browser dashboard at {url}"
+
+    detail = windows_open.stderr.strip() or windows_open.stdout.strip() or "failed to start a browser"
+    return False, f"Could not open browser dashboard: {detail}"
+
+
 def start_daemon() -> tuple[bool, str]:
     if is_port_open("127.0.0.1", ZEROCLAW_PORT):
         return True, "Daemon already running"
@@ -229,7 +393,12 @@ def start_daemon() -> tuple[bool, str]:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     log = open(LOG_DIR / "zeroclaw.log", "a")
     proc = subprocess.Popen(
-        ["zeroclaw", "daemon", "--host", "0.0.0.0", "--port", str(ZEROCLAW_PORT)],
+        [
+            "zeroclaw", "daemon",
+            "--config-dir", str(ZEROCLAW_HOME),
+            "--host", "0.0.0.0",
+            "--port", str(ZEROCLAW_PORT),
+        ],
         stdout=log, stderr=log, env=get_env(), start_new_session=True
     )
     pid_file = RUNTIME_DIR / "zeroclaw.pid"
@@ -272,10 +441,39 @@ def ensure_zeroclaw_config():
 
 
 def _patch_zeroclaw_config(config: Path):
-    """Ensures gateway port, pairing=false, sandbox=none in config."""
+    """Ensures gateway port, pairing=false, sandbox=none, and current channel schema."""
     if not config.exists():
         return
     text = config.read_text()
+    legacy_channels = re.search(r'(?ms)^\[channels\]\n(.*?)(?=^\[|\Z)', text)
+    if legacy_channels:
+        legacy_body = legacy_channels.group(1)
+        cli_match = re.search(r'^cli\s*=\s*(true|false)\s*$', legacy_body, re.MULTILINE)
+        timeout_match = re.search(r'^message_timeout_secs\s*=\s*(\d+)\s*$', legacy_body, re.MULTILINE)
+        cli_value = cli_match.group(1) if cli_match else 'true'
+        timeout_value = timeout_match.group(1) if timeout_match else '300'
+        if re.search(r'(?m)^\[channels_config\]\s*$', text):
+            def merge_channels_config(match: re.Match[str]) -> str:
+                body = match.group(1)
+                if re.search(r'(?m)^cli\s*=\s*', body):
+                    body = re.sub(r'(?m)^cli\s*=\s*.*$', f'cli = {cli_value}', body, count=1)
+                else:
+                    body = f'cli = {cli_value}\n' + body
+                if re.search(r'(?m)^message_timeout_secs\s*=\s*', body):
+                    body = re.sub(r'(?m)^message_timeout_secs\s*=\s*.*$', f'message_timeout_secs = {timeout_value}', body, count=1)
+                else:
+                    body = body.rstrip() + f'\nmessage_timeout_secs = {timeout_value}\n'
+                return '[channels_config]\n' + body.rstrip() + '\n'
+
+            text = re.sub(r'(?ms)^\[channels_config\]\n(.*?)(?=^\[|\Z)', merge_channels_config, text, count=1)
+            text = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', '', text, count=1)
+        else:
+            channels_config_block = (
+                '[channels_config]\n'
+                f'cli = {cli_value}\n'
+                f'message_timeout_secs = {timeout_value}\n'
+            )
+            text = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', channels_config_block, text, count=1)
     # Patch gateway port
     text = re.sub(r'(port\s*=\s*)\d+', rf'\g<1>{ZEROCLAW_PORT}',
                   text, count=1)  # first port= under [gateway]
@@ -445,7 +643,7 @@ class OnboardScreen(Screen):
 
         self.app.call_from_thread(
             self.query_one("#ob-status", Label).update,
-            "Preparing interactive onboarding…",
+            "Preparing automatic setup…",
         )
         self.app.call_from_thread(self._schedule_setup)
 
@@ -495,52 +693,74 @@ class OnboardScreen(Screen):
         self._schedule_setup()
 
     async def run_setup(self):
-        self.query_one("#ob-buttons", Horizontal).add_class("hidden")
-        self._update_log("🚀  Running setup…\n\n")
+        try:
+            self.query_one("#ob-buttons", Horizontal).add_class("hidden")
+            self._update_log("🚀  Running automatic setup…\n\n")
 
-        # ── Step 1: Ollama ──────────────────────────────────────────────────
-        self._update_log("━━  Step 1/4: Ollama service\n")
-        ok = await asyncio.to_thread(start_ollama)
-        self._update_log(f"{'✅' if ok else '❌'}  Ollama {'reachable' if ok else 'could not start'}\n\n")
-        if not ok:
-            self.query_one("#ob-status", Label).update("Ollama failed to start")
-            self._update_log("⚠️  Fix the Ollama issue and press Retry.\n")
-            self.query_one("#ob-buttons", Horizontal).remove_class("hidden")
-            self._setup_started = False
+            # ── Step 1: Ollama ──────────────────────────────────────────────
+            self._update_log("━━  Step 1/4: Ollama service\n")
+            ok = await asyncio.to_thread(start_ollama)
+            self._update_log(f"{'✅' if ok else '❌'}  Ollama {'reachable' if ok else 'could not start'}\n\n")
+            if not ok:
+                self.query_one("#ob-status", Label).update("Ollama failed to start")
+                self._update_log("⚠️  Fix the Ollama issue and press Retry.\n")
+                self.query_one("#ob-buttons", Horizontal).remove_class("hidden")
+                self._setup_started = False
+                return
+
+            # ── Step 2: Pull model (non-interactive, streamed into log) ──────
+            model = get_model()
+            self._update_log(f"━━  Step 2/4: Pull model ({model})\n")
+
+            def _pull():
+                def log_cb(text):
+                    self.app.call_from_thread(self._update_log, text)
+                return self._stream_cmd_to_log(["ollama", "pull", model.split("/")[-1]], log_cb)
+
+            rc = await asyncio.to_thread(_pull)
+            self._update_log(
+                f"{'✅' if rc == 0 else '⚠️ '}  Model {'pulled' if rc == 0 else f'pull exited {rc}'}\n\n"
+            )
+            if rc != 0:
+                self.query_one("#ob-status", Label).update("Model pull failed")
+                self._update_log("⚠️  Fix the model pull issue and press Retry.\n")
+                self.query_one("#ob-buttons", Horizontal).remove_class("hidden")
+                self._setup_started = False
+                return
+
+            # ── Step 3: automatic ZeroClaw configuration ───────────────────
+            self.query_one("#ob-status", Label).update("Preparing ZeroClaw configuration…")
+            self._update_log("━━  Step 3/4: ZeroClaw configuration\n")
+            await asyncio.to_thread(ensure_zeroclaw_config)
+            self._update_log("✅  ZeroClaw config prepared\n\n")
+
+            # ── Step 4: daemon start + optional Telegram bind ──────────────
+            self.query_one("#ob-status", Label).update("Starting ZeroClaw services…")
+            self._update_log("━━  Step 4/4: ZeroClaw services\n")
+            ok, message = await asyncio.to_thread(start_daemon)
+            self._update_log(f"{'✅' if ok else '❌'}  {message}\n")
+            if not ok:
+                self.query_one("#ob-status", Label).update("ZeroClaw daemon failed to start")
+                self._update_log("⚠️  Fix the daemon issue and press Retry.\n")
+                self.query_one("#ob-buttons", Horizontal).remove_class("hidden")
+                self._setup_started = False
+                return
+
+            telegram_identity = load_env_file().get("ZEROCLAW_TELEGRAM_IDENTITY", "")
+            if has_telegram_channel() and telegram_identity.strip():
+                bind_ok, bind_message = await asyncio.to_thread(bind_telegram_identity, telegram_identity)
+                self._update_log(f"{'✅' if bind_ok else '⚠️ '}  {bind_message}\n")
+            else:
+                self._update_log("ℹ️  Telegram channel not configured; skipping channel bind\n")
+
+            self.query_one("#ob-status", Label).update("Automatic setup complete")
+            self._update_log("\n✅  Automatic setup complete. Opening the control panel…\n")
+            await asyncio.sleep(0.8)
+            self.app.pop_screen()
             return
-
-        # ── Step 2: Pull model (non-interactive, streamed into log) ──────────
-        model = get_model()
-        self._update_log(f"━━  Step 2/4: Pull model ({model})\n")
-
-        def _pull():
-            def log_cb(text):
-                self.app.call_from_thread(self._update_log, text)
-            return self._stream_cmd_to_log(["ollama", "pull", model.split("/")[-1]], log_cb)
-
-        rc = await asyncio.to_thread(_pull)
-        self._update_log(
-            f"{'✅' if rc == 0 else '⚠️ '}  Model {'pulled' if rc == 0 else f'pull exited {rc}'}\n\n"
-        )
-        if rc != 0:
-            self.query_one("#ob-status", Label).update("Model pull failed")
-            self._update_log("⚠️  Fix the model pull issue and press Retry.\n")
-            self.query_one("#ob-buttons", Horizontal).remove_class("hidden")
-            self._setup_started = False
+        except asyncio.CancelledError:
+            # App shutdown can cancel in-flight setup work; treat this as clean.
             return
-
-        # ── Step 3: hand off to launcher for full interactive onboard ───────
-        self.query_one("#ob-status", Label).update("Starting interactive onboarding…")
-        self._update_log("━━  Step 3/4: ZeroClaw onboarding (interactive)\n")
-        self._update_log("   Closing the TUI temporarily.\n")
-        self._update_log("   The launcher will run full 'zeroclaw onboard' in this terminal\n")
-        self._update_log("   so you can complete Telegram and any other interactive setup.\n")
-        self._update_log("   After that, the TUI will start again automatically.\n\n")
-
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        ONBOARD_REQUEST_FILE.write_text("interactive\n")
-        await asyncio.sleep(1.0)
-        self.app.exit()
 
     @on(Button.Pressed, "#btn-close-onboard")
     def close_onboard(self):
@@ -819,6 +1039,7 @@ class ZeroClawTUI(App):
                     yield Label(f"Port: {ZEROCLAW_PORT}", classes="service-status")
                     yield Label("● Checking…", id="daemon-dot", classes="service-status")
                     with Horizontal(classes="card-btns"):
+                        yield Button("Open Browser UI", id="btn-open-browser-ui", variant="primary")
                         yield Button("▶ Start", id="btn-start-daemon", variant="success")
                         yield Button("■ Stop", id="btn-stop-daemon", variant="error")
             yield Rule()
@@ -834,6 +1055,7 @@ class ZeroClawTUI(App):
                 yield Button("Send ↵", id="btn-send", variant="primary")
 
     def _compose_settings(self) -> ComposeResult:
+        telegram = get_telegram_settings()
         with Vertical():
             yield Label("⚙️  Configuration", classes="service-name")
             yield Rule()
@@ -849,9 +1071,22 @@ class ZeroClawTUI(App):
             yield Button("💾 Save Settings", id="btn-save-settings", variant="primary")
             yield Static("", id="settings-status")
             yield Rule()
+            yield Label("📨 Telegram Channel", classes="service-name")
+            with Horizontal(classes="settings-row"):
+                yield Label("Bot Token:", classes="settings-label")
+                yield Input(value=str(telegram["bot_token"]), id="input-telegram-token")
+            with Horizontal(classes="settings-row"):
+                yield Label("Allowed Users:", classes="settings-label")
+                yield Input(value=str(telegram["allowed_users"]), id="input-telegram-users")
+            with Horizontal(classes="settings-row"):
+                yield Label("Bind Identity:", classes="settings-label")
+                yield Input(value=str(telegram["bind_identity"]), id="input-telegram-identity")
+            yield Button("➕ Add Telegram Channel", id="btn-save-telegram", variant="primary")
+            yield Static("", id="telegram-status")
+            yield Rule()
             yield Label("🔧 Maintenance", classes="service-name")
             with Horizontal(classes="settings-row"):
-                yield Button("Re-run Onboarding", id="btn-onboard", variant="default")
+                yield Button("Run Auto Setup", id="btn-onboard", variant="default")
                 yield Button("Restart All Services", id="btn-restart-all", variant="warning")
                 yield Button("Run Self-Test", id="btn-selftest", variant="default")
 
@@ -1002,6 +1237,22 @@ class ZeroClawTUI(App):
             self.call_from_thread(self._update_status, ol, dc)
         threading.Thread(target=worker, daemon=True).start()
 
+    @on(Button.Pressed, "#btn-open-browser-ui")
+    def btn_open_browser_ui(self):
+        log = self.query_one("#dash-log", RichLog)
+        if not is_port_open("127.0.0.1", ZEROCLAW_PORT):
+            log.write(f"[red]ZeroClaw gateway is not running at http://127.0.0.1:{ZEROCLAW_PORT}/[/]")
+            return
+
+        log.write("[yellow]Opening browser dashboard…[/]")
+
+        def worker():
+            ok, message = open_gateway_dashboard()
+            color = "green" if ok else "red"
+            self.call_from_thread(log.write, f"[{color}]{message}[/]")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     @on(Button.Pressed, "#btn-stop-daemon")
     def btn_stop_daemon(self):
         log = self.query_one("#dash-log", RichLog)
@@ -1038,6 +1289,30 @@ class ZeroClawTUI(App):
             status.update("✅  Settings saved. Restart services to apply.")
         except Exception as e:
             status.update(f"❌  {e}")
+
+    @on(Button.Pressed, "#btn-save-telegram")
+    def save_telegram_channel(self):
+        bot_token = self.query_one("#input-telegram-token", Input).value.strip()
+        allowed_users = self.query_one("#input-telegram-users", Input).value.strip()
+        bind_identity = self.query_one("#input-telegram-identity", Input).value.strip()
+        status = self.query_one("#telegram-status", Static)
+        log = self.query_one("#dash-log", RichLog)
+
+        if not bot_token:
+            status.update("❌  Enter a Telegram bot token.")
+            return
+
+        status.update("Configuring Telegram channel…")
+        def worker():
+            ok, message = configure_telegram_channel_and_bind(bot_token, allowed_users, bind_identity)
+            self.call_from_thread(status.update, f"{'✅' if ok else '❌'}  {message}")
+            color = "green" if ok else "red"
+            self.call_from_thread(log.write, f"[{color}]{message}[/]")
+            ol = is_port_open("127.0.0.1", OLLAMA_PORT)
+            dc = is_port_open("127.0.0.1", ZEROCLAW_PORT)
+            self.call_from_thread(self._update_status, ol, dc)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @on(Button.Pressed, "#btn-onboard")
     def re_onboard(self):
@@ -1088,6 +1363,24 @@ class ZeroClawTUI(App):
 
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main() -> int:
     app = ZeroClawTUI()
-    app.run()
+    try:
+        app.run()
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    except asyncio.CancelledError:
+        return 0
+    except BaseException:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        crash_log = LOG_DIR / "control_tui_crash.log"
+        with crash_log.open("a", encoding="utf-8") as handle:
+            handle.write("\n=== control_tui crash ===\n")
+            traceback.print_exc(file=handle)
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
