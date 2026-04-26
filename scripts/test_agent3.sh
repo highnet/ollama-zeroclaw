@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-source /home/joaquin/.cargo/env
-cd /mnt/c/Users/joaqu/ollama-openclaw
+source "$HOME/.cargo/env"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$REPO_ROOT"
 
 # Clear old log
 echo "" > logs/zeroclaw-agent-test.log

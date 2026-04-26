@@ -24,11 +24,20 @@ set -a
 source <(tr -d '\r' < "$ZEROCLAW_ENV_FILE")
 set +a
 
+normalize_ollama_model() {
+    local model="$1"
+    if [[ "$model" == ollama/* ]]; then
+        printf '%s\n' "${model#ollama/}"
+    else
+        printf '%s\n' "$model"
+    fi
+}
+
 export ZEROCLAW_HOME="$ZEROCLAW_HOME_DIR"
 export ZEROCLAW_CONFIG_DIR="$ZEROCLAW_HOME_DIR"
 export OLLAMA_API_KEY="${OLLAMA_API_KEY:-ollama-local}"
 export OLLAMA_PORT="${OLLAMA_PORT:-11434}"
-export ZEROCLAW_MODEL="${ZEROCLAW_MODEL:-${OPENCLAW_MODEL:-qwen2.5:1.5b}}"
+export ZEROCLAW_MODEL="$(normalize_ollama_model "${ZEROCLAW_MODEL:-${OPENCLAW_MODEL:-qwen2.5:1.5b}}")"
 
 require_cmd() {
     local cmd="$1"
@@ -91,10 +100,20 @@ start_background_process() {
     local log_file="$3"
     shift 3
 
+    is_live_pid() {
+        local pid="$1"
+        local state
+        if ! kill -0 "$pid" >/dev/null 2>&1; then
+            return 1
+        fi
+        state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        [[ -n "$state" && "$state" != Z* ]]
+    }
+
     if [[ -f "$pid_file" ]]; then
         local existing_pid
         existing_pid="$(cat "$pid_file")"
-        if kill -0 "$existing_pid" >/dev/null 2>&1; then
+        if is_live_pid "$existing_pid"; then
             echo "$name is already running with PID $existing_pid"
             return 0
         fi

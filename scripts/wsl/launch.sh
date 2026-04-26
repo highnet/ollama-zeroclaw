@@ -11,15 +11,15 @@ trap 'rc=$?; echo; echo "--- TUI exited (code $rc) ---"' EXIT
 # assume interactive shells and may reference unset variables.
 set +u
 source /etc/profile 2>/dev/null || true
-[ -f /home/joaquin/.profile ] && source /home/joaquin/.profile 2>/dev/null || true
-[ -f /home/joaquin/.bashrc ]  && source /home/joaquin/.bashrc  2>/dev/null || true
+[ -f "$HOME/.profile" ] && source "$HOME/.profile" 2>/dev/null || true
+[ -f "$HOME/.bashrc" ]  && source "$HOME/.bashrc"  2>/dev/null || true
 set -u
 
 # Source cargo env (zeroclaw / rustup)
-source /home/joaquin/.cargo/env 2>/dev/null || true
+source "$HOME/.cargo/env" 2>/dev/null || true
 
 # Ensure user-installed binaries (textual, etc.) are on PATH
-export PATH="/home/joaquin/.local/bin:/home/joaquin/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"

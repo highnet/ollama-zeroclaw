@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-source /home/joaquin/.cargo/env
-cd /mnt/c/Users/joaqu/ollama-openclaw
+source "$HOME/.cargo/env"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$REPO_ROOT"
 
 # Note current log size before agent test
 LOG_START_LINE=$(wc -l < logs/zeroclaw.log 2>/dev/null || echo 0)

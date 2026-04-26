@@ -1,11 +1,14 @@
 #!/usr/bin/env python3.12
 """Quick import test for control_tui.py"""
-import sys
 import importlib.util
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CONTROL_TUI_PATH = REPO_ROOT / "scripts" / "wsl" / "control_tui.py"
 
 spec = importlib.util.spec_from_file_location(
     "control_tui",
-    "/mnt/c/Users/joaqu/ollama-openclaw/scripts/wsl/control_tui.py"
+    CONTROL_TUI_PATH
 )
 mod = importlib.util.module_from_spec(spec)
 try:

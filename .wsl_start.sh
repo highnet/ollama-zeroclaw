@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Starter script to be executed inside WSL from Windows Terminal
-REPO_WSL_PATH="/mnt/c/Users/joaqu/ollama-openclaw"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_WSL_PATH="$SCRIPT_DIR"
 cd "$REPO_WSL_PATH"
 
 # Ensure env and tools are available

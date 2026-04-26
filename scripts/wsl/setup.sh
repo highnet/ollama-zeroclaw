@@ -10,6 +10,7 @@ LOG_DIR="$REPO_ROOT/logs"
 ZEROCLAW_HOME_DIR="$REPO_ROOT/.zeroclaw-home"
 ZEROCLAW_ENV_FILE="$REPO_ROOT/.env"
 ZEROCLAW_CONFIG_PATH="$ZEROCLAW_HOME_DIR/config.toml"
+ZEROCLAW_WEB_DIST_DIR="$ZEROCLAW_HOME_DIR/web-dist"
 
 mkdir -p "$RUNTIME_DIR" "$LOG_DIR" "$ZEROCLAW_HOME_DIR"
 
@@ -21,9 +22,18 @@ set -a
 source <(tr -d '\r' < "$ZEROCLAW_ENV_FILE")
 set +a
 
+normalize_ollama_model() {
+    local model="$1"
+    if [[ "$model" == ollama/* ]]; then
+        printf '%s\n' "${model#ollama/}"
+    else
+        printf '%s\n' "$model"
+    fi
+}
+
 export ZEROCLAW_HOME="$ZEROCLAW_HOME_DIR"
 export ZEROCLAW_PORT="${ZEROCLAW_PORT:-18789}"
-export ZEROCLAW_MODEL="${ZEROCLAW_MODEL:-ollama/qwen2.5:1.5b}"
+export ZEROCLAW_MODEL="$(normalize_ollama_model "${ZEROCLAW_MODEL:-qwen2.5:1.5b}")"
 
 require_cmd() {
     local cmd="$1"
@@ -36,27 +46,38 @@ require_cmd() {
 }
 
 find_zeroclaw_web_dir() {
-    local version
-    version="$(zeroclaw --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
-    if [[ -z "$version" ]]; then
-        return 1
-    fi
-
-    find "$HOME/.cargo/registry/src" -type f -path "*/zeroclaw-$version/web/package.json" -print -quit 2>/dev/null \
+    find "$HOME/.cargo/registry/src" -type f -path '*/zeroclaw-*/web/package.json' -print 2>/dev/null \
+        | sort -r \
+        | head -n 1 \
         | sed 's#/package.json$##'
 }
 
 build_gateway_dashboard() {
     local web_dir
+    local built_dist_dir
 
-    if ! command -v npm >/dev/null 2>&1; then
-        echo "Skipping dashboard build: npm is not installed in WSL."
-        return 0
-    fi
+    copy_repo_web_dist() {
+        local source_dist_dir="$1"
+        mkdir -p "$ZEROCLAW_WEB_DIST_DIR"
+        rm -rf "$ZEROCLAW_WEB_DIST_DIR"/*
+        cp -R "$source_dist_dir"/. "$ZEROCLAW_WEB_DIST_DIR"/
+        echo "Copied dashboard assets to $ZEROCLAW_WEB_DIST_DIR"
+    }
 
     web_dir="$(find_zeroclaw_web_dir || true)"
     if [[ -z "$web_dir" ]]; then
         echo "Skipping dashboard build: could not locate zeroclaw web sources under ~/.cargo/registry/src."
+        return 0
+    fi
+
+    built_dist_dir="$web_dir/dist"
+    if [[ -d "$built_dist_dir" && -f "$built_dist_dir/index.html" ]]; then
+        copy_repo_web_dist "$built_dist_dir"
+        return 0
+    fi
+
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "Skipping dashboard build: npm is not installed in WSL."
         return 0
     fi
 
@@ -66,6 +87,14 @@ build_gateway_dashboard() {
     else
         (cd "$web_dir" && npm install && npm run build)
     fi
+
+    built_dist_dir="$web_dir/dist"
+    if [[ ! -d "$built_dist_dir" ]]; then
+        echo "Skipping dashboard copy: build completed but $built_dist_dir was not found."
+        return 0
+    fi
+
+    copy_repo_web_dist "$built_dist_dir"
 }
 
 ensure_zeroclaw_token() {
@@ -152,10 +181,20 @@ start_background_process() {
     local log_file="$3"
     shift 3
 
+    is_live_pid() {
+        local pid="$1"
+        local state
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+        state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        [[ -n "$state" && "$state" != Z* ]]
+    }
+
     if [[ -f "$pid_file" ]]; then
         local existing_pid
         existing_pid="$(cat "$pid_file")"
-        if kill -0 "$existing_pid" 2>/dev/null; then
+        if is_live_pid "$existing_pid"; then
             echo "$name is already running with PID $existing_pid"
             return 0
         fi
@@ -213,15 +252,11 @@ else
 fi
 
 # Pull the model only if not already present
-_model_simple="${ZEROCLAW_MODEL#*/}"
+_model_simple="$ZEROCLAW_MODEL"
 if ollama list 2>/dev/null | grep -qF "${_model_simple%%:*}"; then
     echo "Model ${_model_simple} already present, skipping pull."
 else
-    if ! ollama pull "$ZEROCLAW_MODEL"; then
-        simple="${ZEROCLAW_MODEL#*/}"
-        echo "Retrying pull with '$simple'"
-        ollama pull "$simple" || true
-    fi
+    ollama pull "$ZEROCLAW_MODEL" || true
 fi
 
 build_gateway_dashboard
@@ -234,11 +269,20 @@ if [[ ! -f "$ZEROCLAW_CONFIG_PATH" ]]; then
 fi
 # Always patch critical settings (idempotent)
 python3 - <<PYEOF
-import re, pathlib
+import pathlib
+import re
 p = pathlib.Path(r"$ZEROCLAW_CONFIG_PATH")
+repo_web_dist = pathlib.Path(r"$ZEROCLAW_WEB_DIST_DIR")
 if not p.exists():
     raise SystemExit(0)
 txt = p.read_text()
+if re.search(r'(?ms)^\[providers\.models\.ollama\]\n', txt):
+    txt = re.sub(
+        r'(?ms)(^\[providers\.models\.ollama\]\n.*?^model\s*=\s*")([^"]+)("\s*$)',
+        rf'\g<1>$ZEROCLAW_MODEL\g<3>',
+        txt,
+        count=1,
+    )
 legacy_channels = re.search(r'(?ms)^\[channels\]\n(.*?)(?=^\[|\Z)', txt)
 if legacy_channels:
     legacy_body = legacy_channels.group(1)
@@ -274,15 +318,26 @@ if '[gateway]' not in txt:
 else:
     txt = re.sub(r'(port\s*=\s*)\d+', r'\g<1>$ZEROCLAW_PORT', txt, count=1)
     txt = re.sub(r'require_pairing\s*=\s*(true|false)', 'require_pairing = false', txt)
+# Prefer repo-local dashboard assets when present, and strip user-local paths otherwise.
+gateway_has_web_dist = re.search(r'(?m)^web_dist_dir\s*=\s*"', txt) is not None
+if repo_web_dist.is_dir() and any(repo_web_dist.iterdir()):
+    replacement = f'web_dist_dir = "{repo_web_dist.as_posix()}"'
+    if gateway_has_web_dist:
+        txt = re.sub(r'(?m)^web_dist_dir\s*=\s*"[^"]*"\s*$', replacement, txt, count=1)
+    else:
+        txt = re.sub(r'(?m)^(\[gateway\]\n)', r'\1' + replacement + '\n', txt, count=1)
+else:
+    txt = re.sub(r'(?m)^web_dist_dir\s*=\s*"[^"]*"\s*\n?', '', txt, count=1)
 # Patch sandbox
 txt = re.sub(r'(\[security\.sandbox\][^\[]*?backend\s*=\s*)"[^"]+"',
              r'\1"none"', txt, flags=re.DOTALL)
 p.write_text(txt)
-print("Config patched: gateway=$ZEROCLAW_PORT pairing=false sandbox=none channels_schema=current")
+print("Config patched: gateway=$ZEROCLAW_PORT pairing=false sandbox=none channels_schema=current web_dist=repo-local-or-unset")
 PYEOF
 
 # Start ZeroClaw daemon (only if zeroclaw is installed in WSL)
 if command -v zeroclaw >/dev/null 2>&1; then
+    pkill -f "zeroclaw daemon.*$ZEROCLAW_HOME_DIR" >/dev/null 2>&1 || true
     start_background_process \
         "zeroclaw" \
         "$RUNTIME_DIR/zeroclaw.pid" \

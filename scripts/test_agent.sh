@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /home/joaquin/.cargo/env
+source "$HOME/.cargo/env"
 
 # Fresh test dir
 rm -rf /tmp/zc-testdir

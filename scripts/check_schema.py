@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-import subprocess, json, sys
+import json
+import subprocess
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_DIR = REPO_ROOT / ".zeroclaw-home"
 
 result = subprocess.run(
-    ["zeroclaw", "config", "--config-dir", "/mnt/c/Users/joaqu/ollama-openclaw/.zeroclaw-home", "schema"],
+    ["zeroclaw", "config", "--config-dir", str(CONFIG_DIR), "schema"],
     capture_output=True, text=True, timeout=10
 )
 schema = json.loads(result.stdout)

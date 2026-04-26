@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /home/joaquin/.cargo/env
+source "$HOME/.cargo/env"
 
 # Download pip bootstrap
 python3 - <<'PYEOF'

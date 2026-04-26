@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /home/joaquin/.cargo/env
+source "$HOME/.cargo/env"
 
 # Run zeroclaw agent and capture all output including any early exit messages
 export ZEROCLAW_CONFIG_DIR=/tmp/zc-testdir

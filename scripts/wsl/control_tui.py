@@ -28,11 +28,19 @@ ENV_FILE = REPO_ROOT / ".env"
 RUNTIME_DIR = REPO_ROOT / ".runtime"
 LOG_DIR = REPO_ROOT / "logs"
 SESSION_FILE = RUNTIME_DIR / "session.json"
-CARGO_ENV = Path("/home") / os.environ.get("USER", "joaquin") / ".cargo" / "env"
+CARGO_ENV = Path.home() / ".cargo" / "env"
+GATEWAY_WEB_DIST_DIR = ZEROCLAW_HOME / "web-dist"
 
 ZEROCLAW_PORT = int(os.environ.get("ZEROCLAW_PORT", "18789"))
 OLLAMA_PORT = int(os.environ.get("OLLAMA_PORT", "11434"))
 DEFAULT_MODEL = "qwen2.5:1.5b"
+
+
+def normalize_ollama_model(model: str) -> str:
+    model = model.strip()
+    if model.startswith("ollama/"):
+        return model.split("/", 1)[1]
+    return model
 
 
 def get_env() -> dict:
@@ -59,7 +67,7 @@ def get_env() -> dict:
 
 def get_model() -> str:
     env = get_env()
-    return env.get("ZEROCLAW_MODEL", DEFAULT_MODEL)
+    return normalize_ollama_model(env.get("ZEROCLAW_MODEL", DEFAULT_MODEL))
 
 
 def load_env_file() -> dict[str, str]:
@@ -441,10 +449,17 @@ def ensure_zeroclaw_config():
 
 
 def _patch_zeroclaw_config(config: Path):
-    """Ensures gateway port, pairing=false, sandbox=none, and current channel schema."""
+    """Ensures gateway port, pairing=false, sandbox=none, repo-local dashboard assets, and current channel schema."""
     if not config.exists():
         return
     text = config.read_text()
+    if re.search(r'(?ms)^\[providers\.models\.ollama\]\n', text):
+        text = re.sub(
+            r'(?ms)(^\[providers\.models\.ollama\]\n.*?^model\s*=\s*")([^"]+)("\s*$)',
+            rf'\g<1>{get_model()}\g<3>',
+            text,
+            count=1,
+        )
     legacy_channels = re.search(r'(?ms)^\[channels\]\n(.*?)(?=^\[|\Z)', text)
     if legacy_channels:
         legacy_body = legacy_channels.group(1)
@@ -474,11 +489,21 @@ def _patch_zeroclaw_config(config: Path):
                 f'message_timeout_secs = {timeout_value}\n'
             )
             text = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', channels_config_block, text, count=1)
-    # Patch gateway port
-    text = re.sub(r'(port\s*=\s*)\d+', rf'\g<1>{ZEROCLAW_PORT}',
-                  text, count=1)  # first port= under [gateway]
-    # Patch require_pairing
-    text = re.sub(r'require_pairing\s*=\s*(true|false)', 'require_pairing = false', text)
+    if '[gateway]' not in text:
+        text = text.rstrip() + f'\n\n[gateway]\nport = {ZEROCLAW_PORT}\nrequire_pairing = false\n'
+    else:
+        text = re.sub(r'(port\s*=\s*)\d+', rf'\g<1>{ZEROCLAW_PORT}',
+                      text, count=1)
+        text = re.sub(r'require_pairing\s*=\s*(true|false)', 'require_pairing = false', text)
+    # Prefer repo-local dashboard assets and strip stale user-specific cargo paths.
+    if GATEWAY_WEB_DIST_DIR.is_dir() and any(GATEWAY_WEB_DIST_DIR.iterdir()):
+        replacement = f'web_dist_dir = "{GATEWAY_WEB_DIST_DIR.as_posix()}"'
+        if re.search(r'(?m)^web_dist_dir\s*=\s*"', text):
+            text = re.sub(r'(?m)^web_dist_dir\s*=\s*"[^"]*"\s*$', replacement, text, count=1)
+        else:
+            text = re.sub(r'(?m)^(\[gateway\]\n)', r'\1' + replacement + '\n', text, count=1)
+    else:
+        text = re.sub(r'(?m)^web_dist_dir\s*=\s*"[^"]*"\s*\n?', '', text, count=1)
     # Patch sandbox backend
     text = re.sub(r'(\[security\.sandbox\][^\[]*?backend\s*=\s*)"[^"]+"',
                   r'\1"none"', text, flags=re.DOTALL)
@@ -1267,7 +1292,7 @@ class ZeroClawTUI(App):
 
     @on(Button.Pressed, "#btn-save-settings")
     def save_settings(self):
-        model = self.query_one("#input-model", Input).value.strip()
+        model = normalize_ollama_model(self.query_one("#input-model", Input).value)
         zc_port = self.query_one("#input-zc-port", Input).value.strip()
         ol_port = self.query_one("#input-ol-port", Input).value.strip()
         status = self.query_one("#settings-status", Static)

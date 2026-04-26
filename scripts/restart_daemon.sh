@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /home/joaquin/.cargo/env
-cd /mnt/c/Users/joaqu/ollama-openclaw
+source "$HOME/.cargo/env"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$REPO_ROOT"
 
 pkill -f zeroclaw 2>/dev/null && sleep 2 || true
 
@@ -10,7 +14,7 @@ DAEMON_PID=$!
 echo "Daemon PID: $DAEMON_PID"
 sleep 4
 
-python3 /mnt/c/Users/joaqu/ollama-openclaw/scripts/test_ollama.py
+python3 "$SCRIPT_DIR/test_ollama.py"
 python3 - <<'PYEOF'
 import urllib.request
 try:
