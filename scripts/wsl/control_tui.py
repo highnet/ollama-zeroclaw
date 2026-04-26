@@ -16,6 +16,7 @@ import threading
 import tomllib
 import traceback
 import time
+from urllib.parse import urlparse
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -33,7 +34,61 @@ GATEWAY_WEB_DIST_DIR = ZEROCLAW_HOME / "web-dist"
 
 ZEROCLAW_PORT = int(os.environ.get("ZEROCLAW_PORT", "18789"))
 OLLAMA_PORT = int(os.environ.get("OLLAMA_PORT", "11434"))
+OLLAMA_WINDOWS_PROXY_PORT = int(os.environ.get("OLLAMA_WINDOWS_PROXY_PORT", "11435"))
 DEFAULT_MODEL = "qwen2.5:1.5b"
+
+
+def parse_ollama_host(url: str | None = None) -> tuple[str, int]:
+    raw = (url or f"http://127.0.0.1:{OLLAMA_PORT}").strip()
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    return parsed.hostname or "127.0.0.1", parsed.port or OLLAMA_PORT
+
+
+def resolve_windows_ollama_host() -> str | None:
+    candidates: list[str] = []
+    try:
+        route_result = subprocess.run(
+            ["ip", "route"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=os.environ.copy(),
+        )
+        route_lines = route_result.stdout.splitlines()
+        for line in route_lines:
+            if line.startswith("default "):
+                parts = line.split()
+                if "via" in parts:
+                    gateway = parts[parts.index("via") + 1]
+                    candidates.append(f"http://{gateway}:{OLLAMA_WINDOWS_PROXY_PORT}")
+                break
+    except Exception:
+        pass
+
+    try:
+        for line in Path("/etc/resolv.conf").read_text().splitlines():
+            if line.startswith("nameserver "):
+                nameserver = line.split(None, 1)[1].strip()
+                if nameserver:
+                    candidates.append(f"http://{nameserver}:{OLLAMA_PORT}")
+                break
+    except OSError:
+        pass
+
+    candidates.append(f"http://host.docker.internal:{OLLAMA_WINDOWS_PROXY_PORT}")
+    candidates.append(f"http://host.docker.internal:{OLLAMA_PORT}")
+    for candidate in candidates:
+        host, port = parse_ollama_host(candidate)
+        if is_port_open(host, port):
+            return candidate.rstrip("/")
+    return None
+
+
+def get_ollama_host() -> str:
+    env_file_host = load_env_file().get("OLLAMA_HOST")
+    if env_file_host:
+        return env_file_host.rstrip("/")
+    return resolve_windows_ollama_host() or f"http://127.0.0.1:{OLLAMA_PORT}"
 
 
 def normalize_ollama_model(model: str) -> str:
@@ -57,9 +112,7 @@ def get_env() -> dict:
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
                 env.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-    # Point Ollama clients at the GPU-accelerated Windows Ollama instance.
-    # WSL2 mirrored networking exposes Windows localhost into WSL unchanged.
-    env.setdefault("OLLAMA_HOST", "http://localhost:11434")
+    env.setdefault("OLLAMA_HOST", get_ollama_host())
     env.setdefault("ZEROCLAW_HOME", str(ZEROCLAW_HOME))
     env.setdefault("ZEROCLAW_CONFIG_DIR", str(ZEROCLAW_HOME))
     return env
@@ -189,6 +242,8 @@ def bind_telegram_identity(identity: str) -> tuple[bool, str]:
         "channel", "bind-telegram", normalized,
     ])
     if result.returncode == 0:
+        config = ZEROCLAW_HOME / "config.toml"
+        _patch_zeroclaw_config(config)
         output = (result.stdout or "").strip()
         return True, output or f"Bound Telegram identity {normalized}"
     detail = ((result.stderr or result.stdout) or "Failed to bind Telegram identity").strip()
@@ -281,7 +336,8 @@ class OnboardStatus:
         _ollama = shutil.which("ollama")
         self.ollama_bin: bool = bool(_ollama and not _ollama.startswith("/mnt/"))
         self.zeroclaw_bin: bool = self._has_zeroclaw()
-        self.ollama_running: bool = is_port_open("127.0.0.1", OLLAMA_PORT)
+        ollama_host, ollama_port = parse_ollama_host(get_ollama_host())
+        self.ollama_running: bool = is_port_open(ollama_host, ollama_port)
         self.model_pulled: bool = self._model_pulled()
         self.daemon_running: bool = is_port_open("127.0.0.1", ZEROCLAW_PORT)
         self.config_ok: bool = (ZEROCLAW_HOME / "config.toml").exists()
@@ -315,23 +371,34 @@ class OnboardStatus:
 def start_ollama() -> bool:
     """Return True if Ollama is reachable (Windows GPU instance preferred).
     Only falls back to spawning WSL ollama if there is truly nothing on the port."""
-    if is_port_open("127.0.0.1", OLLAMA_PORT):
+    env = get_env()
+    ollama_host, ollama_port = parse_ollama_host(env.get("OLLAMA_HOST"))
+    if is_port_open(ollama_host, ollama_port):
         return True
 
     # Prefer Windows Ollama from the TUI as well, otherwise Stop/Start becomes inconsistent.
     windows_start = run_windows_powershell(
         "$ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\\Ollama\\ollama.exe'; "
-        "if (Test-Path $ollamaExe) { Start-Process $ollamaExe -WindowStyle Hidden; exit 0 } "
+        "$envVars = @{ OLLAMA_HOST = 'http://127.0.0.1:11434' }; "
+        "$amdGpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -First 1; "
+        "if ($amdGpu) { $envVars['OLLAMA_VULKAN'] = '1' }; "
+        "$startInfo = New-Object System.Diagnostics.ProcessStartInfo; "
+        "$startInfo.FileName = $ollamaExe; "
+        "$startInfo.UseShellExecute = $false; "
+        "$startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden; "
+        "foreach ($entry in $envVars.GetEnumerator()) { $startInfo.Environment[$entry.Key] = $entry.Value }; "
+        "if (Test-Path $ollamaExe) { [System.Diagnostics.Process]::Start($startInfo) | Out-Null; exit 0 } "
         "exit 1"
     )
-    if windows_start.returncode == 0 and wait_for_port_state("127.0.0.1", OLLAMA_PORT, True, timeout=8.0):
+    if windows_start.returncode == 0 and wait_for_port_state(ollama_host, ollama_port, True, timeout=8.0):
         return True
 
     # Fall back to spawning WSL Ollama.
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     log = open(LOG_DIR / "ollama.log", "a")
-    env = get_env()
+    env["OLLAMA_HOST"] = f"http://127.0.0.1:{OLLAMA_PORT}"
     proc = subprocess.Popen(["ollama", "serve"], stdout=log, stderr=log,
                              env=env, start_new_session=True)
     pid_file = RUNTIME_DIR / "ollama.pid"
@@ -489,6 +556,16 @@ def _patch_zeroclaw_config(config: Path):
                 f'message_timeout_secs = {timeout_value}\n'
             )
             text = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', channels_config_block, text, count=1)
+    legacy_telegram = re.search(r'(?ms)^\[channels\.telegram\]\n(.*?)(?=^\[|\Z)', text)
+    if legacy_telegram:
+        legacy_body = legacy_telegram.group(1).rstrip()
+        replacement = '[channels_config.telegram]\n'
+        if legacy_body:
+            replacement += legacy_body + '\n'
+        if re.search(r'(?m)^\[channels_config\.telegram\]\s*$', text):
+            text = re.sub(r'(?ms)^\[channels\.telegram\]\n.*?(?=^\[|\Z)', '', text, count=1)
+        else:
+            text = re.sub(r'(?ms)^\[channels\.telegram\]\n.*?(?=^\[|\Z)', replacement, text, count=1)
     if '[gateway]' not in text:
         text = text.rstrip() + f'\n\n[gateway]\nport = {ZEROCLAW_PORT}\nrequire_pairing = false\n'
     else:

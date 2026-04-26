@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $repoPath = (Resolve-Path $PSScriptRoot).Path
 $drive = $repoPath.Substring(0, 1).ToLowerInvariant()
-$rest = $repoPath.Substring(2).Replace('\\', '/')
+$rest = $repoPath.Substring(2).Replace('\', '/')
 $wslRepoPath = "/mnt/$drive$rest"
 
 # Stop ZeroClaw daemon and Ollama in WSL via bash pkill (run inside bash)

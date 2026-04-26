@@ -11,7 +11,8 @@ require_cmd zeroclaw
 write_zeroclaw_config
 stop_legacy_openclaw_if_present
 
-if ! is_port_open 127.0.0.1 "$OLLAMA_PORT"; then
+if ! ollama_host_is_reachable; then
+    use_local_ollama_host
     start_background_process \
         "ollama" \
         "$RUNTIME_DIR/ollama.pid" \

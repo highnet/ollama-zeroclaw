@@ -19,6 +19,104 @@ function Wait-TcpPort([int]$Port, [int]$TimeoutSeconds = 15) {
     return $false
 }
 
+function Get-OllamaStartupEnvironment {
+    $envOverrides = @{
+        'OLLAMA_HOST' = 'http://127.0.0.1:11434'
+    }
+
+    try {
+        $amdGpu = Get-CimInstance Win32_VideoController -ErrorAction Stop |
+            Where-Object { $_.Name -match 'AMD|Radeon' } |
+            Select-Object -First 1
+        if ($amdGpu) {
+            $envOverrides['OLLAMA_VULKAN'] = '1'
+        }
+    } catch {
+    }
+
+    return $envOverrides
+}
+
+function Start-OllamaProcess([string]$OllamaExe, [hashtable]$EnvironmentOverrides) {
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $OllamaExe
+    $startInfo.UseShellExecute = $false
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+
+    foreach ($entry in $EnvironmentOverrides.GetEnumerator()) {
+        $startInfo.Environment[$entry.Key] = $entry.Value
+    }
+
+    [System.Diagnostics.Process]::Start($startInfo) | Out-Null
+}
+
+function Stop-WindowsOllama([int]$Port = 11434) {
+    Get-Process -Name 'ollama' -ErrorAction SilentlyContinue | Stop-Process -Force
+
+    $deadline = (Get-Date).AddSeconds(15)
+    do {
+        $listening = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+        if (-not $listening) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 300
+    } while ((Get-Date) -lt $deadline)
+
+    return $false
+}
+
+function Start-WindowsOllamaProxy([string]$RepoPath, [int]$ListenPort = 11435) {
+    $existing = Get-NetTCPConnection -LocalPort $ListenPort -State Listen -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "Windows Ollama proxy already running on port $ListenPort"
+        return
+    }
+
+    $proxyScript = Join-Path $RepoPath 'scripts\windows\localhost_proxy.py'
+    if (-not (Test-Path $proxyScript)) {
+        Write-Warning "Proxy script not found at $proxyScript"
+        return
+    }
+
+    $pythonExe = Join-Path $RepoPath '.venv\Scripts\python.exe'
+    $command = $null
+    $args = @()
+    if (Test-Path $pythonExe) {
+        $command = $pythonExe
+        $args = @(
+            $proxyScript,
+            '--listen-host', '0.0.0.0',
+            '--listen-port', "$ListenPort",
+            '--target-host', '127.0.0.1',
+            '--target-port', '11434'
+        )
+    } else {
+        $py = Get-Command py.exe -ErrorAction SilentlyContinue
+        if ($py) {
+            $command = $py.Source
+            $args = @(
+                '-3',
+                $proxyScript,
+                '--listen-host', '0.0.0.0',
+                '--listen-port', "$ListenPort",
+                '--target-host', '127.0.0.1',
+                '--target-port', '11434'
+            )
+        }
+    }
+
+    if (-not $command) {
+        Write-Warning 'No Python interpreter available to start the Windows Ollama proxy.'
+        return
+    }
+
+    Write-Host "Starting Windows Ollama proxy on port $ListenPort..."
+    Start-Process -FilePath $command -ArgumentList $args -WindowStyle Hidden
+    if (-not (Wait-TcpPort -Port $ListenPort -TimeoutSeconds 5)) {
+        Write-Warning "Windows Ollama proxy did not open port $ListenPort in time."
+    }
+}
+
 function Get-PreferredWslDistro {
     $distros = @(wsl -l -q 2>$null) | Where-Object { $_ -and $_.Trim() -ne '' }
     if ($distros -contains 'Ubuntu-24.04') {
@@ -46,12 +144,23 @@ if (-not $distro) {
 # WSL2 mirrored networking exposes localhost:11434 into WSL unchanged.
 $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
 if (Test-Path $ollamaExe) {
+    $ollamaEnv = Get-OllamaStartupEnvironment
+    $needsAmdGpuRestart = $ollamaEnv.ContainsKey('OLLAMA_VULKAN')
     $running = Get-Process -Name 'ollama' -ErrorAction SilentlyContinue
     $listening = Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue
 
-    if (-not $running -and -not $listening) {
+    if ($needsAmdGpuRestart -and ($running -or $listening)) {
+        Write-Host 'Restarting Windows Ollama with Vulkan enabled...'
+        if (-not (Stop-WindowsOllama)) {
+            Write-Warning 'Windows Ollama did not fully stop before restart.'
+        }
+        Start-OllamaProcess -OllamaExe $ollamaExe -EnvironmentOverrides $ollamaEnv
+        if (-not (Wait-TcpPort -Port 11434 -TimeoutSeconds 15)) {
+            Write-Warning 'Windows Ollama did not open port 11434 in time. WSL fallback may be used.'
+        }
+    } elseif (-not $running -and -not $listening) {
         Write-Host 'Starting Windows Ollama (GPU)...'
-        Start-Process $ollamaExe -WindowStyle Hidden
+        Start-OllamaProcess -OllamaExe $ollamaExe -EnvironmentOverrides $ollamaEnv
         if (-not (Wait-TcpPort -Port 11434 -TimeoutSeconds 15)) {
             Write-Warning 'Windows Ollama did not open port 11434 in time. WSL fallback may be used.'
         }
@@ -62,6 +171,8 @@ if (Test-Path $ollamaExe) {
 } else {
     Write-Warning "ollama.exe not found at $ollamaExe - will use WSL CPU fallback"
 }
+
+Start-WindowsOllamaProxy -RepoPath $repoPath
 
 $wtCmd = Get-Command wt.exe -ErrorAction SilentlyContinue
 

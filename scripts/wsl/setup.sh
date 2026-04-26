@@ -34,6 +34,38 @@ normalize_ollama_model() {
 export ZEROCLAW_HOME="$ZEROCLAW_HOME_DIR"
 export ZEROCLAW_PORT="${ZEROCLAW_PORT:-18789}"
 export ZEROCLAW_MODEL="$(normalize_ollama_model "${ZEROCLAW_MODEL:-qwen2.5:1.5b}")"
+export OLLAMA_PORT="${OLLAMA_PORT:-11434}"
+export OLLAMA_WINDOWS_PROXY_PORT="${OLLAMA_WINDOWS_PROXY_PORT:-11435}"
+
+resolve_windows_ollama_host() {
+    local port="${OLLAMA_PORT:-11434}"
+    local proxy_port="${OLLAMA_WINDOWS_PROXY_PORT:-11435}"
+    local gateway
+    local nameserver
+    local candidate
+
+    gateway="$(ip route 2>/dev/null | awk '/^default / {print $3; exit}' || true)"
+    nameserver="$(awk '/^nameserver[[:space:]]+/ {print $2; exit}' /etc/resolv.conf 2>/dev/null || true)"
+    for candidate in \
+        "${gateway:+http://$gateway:$proxy_port}" \
+        "http://host.docker.internal:$proxy_port" \
+        "${nameserver:+http://$nameserver:$port}" \
+        "${gateway:+http://$gateway:$port}" \
+        "http://host.docker.internal:$port"
+    do
+        [[ -z "$candidate" ]] && continue
+        if curl -fsS --max-time 1 "$candidate/api/tags" >/dev/null 2>&1; then
+            printf '%s\n' "${candidate%/}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+use_local_ollama_host() {
+    export OLLAMA_HOST="http://127.0.0.1:${OLLAMA_PORT:-11434}"
+}
 
 require_cmd() {
     local cmd="$1"
@@ -236,13 +268,15 @@ stop_process_from_pid_file() {
 }
 
 # ── Ollama: prefer Windows GPU instance, fall back to WSL CPU ─────────────────
-# With WSL2 mirrored networking, Windows Ollama is reachable at localhost:11434.
-export OLLAMA_HOST="http://localhost:11434"
+if [[ -z "${OLLAMA_HOST:-}" ]] && resolved_ollama_host="$(resolve_windows_ollama_host)"; then
+    export OLLAMA_HOST="$resolved_ollama_host"
+fi
 
-if is_port_open 127.0.0.1 11434; then
+if [[ -n "${OLLAMA_HOST:-}" ]]; then
     echo "Ollama reachable at $OLLAMA_HOST (Windows GPU instance)"
 else
     echo "Windows Ollama not detected — starting WSL Ollama (CPU fallback)..."
+    use_local_ollama_host
     start_background_process \
         "ollama" \
         "$RUNTIME_DIR/ollama.pid" \
@@ -267,6 +301,11 @@ if [[ ! -f "$ZEROCLAW_CONFIG_PATH" ]]; then
         --provider ollama --model "$ZEROCLAW_MODEL" \
         --config-dir "$ZEROCLAW_HOME_DIR" >/dev/null
 fi
+
+if [[ -n "${ZEROCLAW_TELEGRAM_IDENTITY:-}" ]] && command -v zeroclaw >/dev/null 2>&1; then
+    zeroclaw --config-dir "$ZEROCLAW_HOME_DIR" channel bind-telegram "$ZEROCLAW_TELEGRAM_IDENTITY" >/dev/null 2>&1 || true
+fi
+
 # Always patch critical settings (idempotent)
 python3 - <<PYEOF
 import pathlib
@@ -312,6 +351,16 @@ if legacy_channels:
             f'message_timeout_secs = {timeout_value}\n'
         )
         txt = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', channels_config_block, txt, count=1)
+legacy_telegram = re.search(r'(?ms)^\[channels\.telegram\]\n(.*?)(?=^\[|\Z)', txt)
+if legacy_telegram:
+    legacy_body = legacy_telegram.group(1).rstrip()
+    replacement = '[channels_config.telegram]\n'
+    if legacy_body:
+        replacement += legacy_body + '\n'
+    if re.search(r'(?m)^\[channels_config\.telegram\]\s*$', txt):
+        txt = re.sub(r'(?ms)^\[channels\.telegram\]\n.*?(?=^\[|\Z)', '', txt, count=1)
+    else:
+        txt = re.sub(r'(?ms)^\[channels\.telegram\]\n.*?(?=^\[|\Z)', replacement, txt, count=1)
 # Insert/update [gateway] section port
 if '[gateway]' not in txt:
     txt += '\n[gateway]\nport = $ZEROCLAW_PORT\nrequire_pairing = false\n'

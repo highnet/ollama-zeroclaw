@@ -8,10 +8,11 @@ echo "Repository: $REPO_ROOT"
 echo "ZeroClaw home: $ZEROCLAW_HOME_DIR"
 echo "Model: $ZEROCLAW_MODEL"
 echo "Config: $ZEROCLAW_CONFIG_PATH"
+echo "Ollama host: $OLLAMA_HOST"
 echo
 
-if is_port_open 127.0.0.1 "$OLLAMA_PORT"; then
-    echo "Ollama: running on 127.0.0.1:$OLLAMA_PORT"
+if ollama_host_is_reachable; then
+    echo "Ollama: running on $(ollama_host_name):$(ollama_host_port)"
 else
     echo "Ollama: stopped"
 fi
