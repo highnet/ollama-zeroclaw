@@ -303,6 +303,28 @@ def run_windows_powershell(script: str) -> subprocess.CompletedProcess:
     )
 
 
+def force_windows_ollama_gpu() -> bool:
+    script = (
+        "$ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\\Ollama\\ollama.exe'; "
+        "$amdGpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -First 1; "
+        "if (-not $amdGpu -or -not (Test-Path $ollamaExe)) { exit 1 }; "
+        "[System.Environment]::SetEnvironmentVariable('OLLAMA_VULKAN', '1', 'User'); "
+        "Get-Process -Name 'ollama' -ErrorAction SilentlyContinue | Stop-Process -Force; "
+        "$deadline = (Get-Date).AddSeconds(15); "
+        "do { $listening = Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue; "
+        "if (-not $listening) { break }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt $deadline); "
+        "$escapedExe = $ollamaExe.Replace(\"'\", \"''\"); "
+        "$serveScript = \"$env:OLLAMA_HOST = 'http://127.0.0.1:11434'; $env:OLLAMA_VULKAN = '1'; & '$escapedExe' serve\"; "
+        "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $serveScript); "
+        "$deadline = (Get-Date).AddSeconds(20); "
+        "do { $listening = Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue; "
+        "if ($listening) { exit 0 }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt $deadline); "
+        "exit 1"
+    )
+    return run_windows_powershell(script).returncode == 0
+
+
 def read_log_tail(path: Path, max_lines: int = 8) -> str:
     if not path.exists():
         return ""
@@ -372,6 +394,12 @@ def start_ollama() -> bool:
     """Return True if Ollama is reachable (Windows GPU instance preferred).
     Only falls back to spawning WSL ollama if there is truly nothing on the port."""
     env = get_env()
+    if force_windows_ollama_gpu():
+        env["OLLAMA_HOST"] = resolve_windows_ollama_host() or f"http://127.0.0.1:{OLLAMA_PORT}"
+        ollama_host, ollama_port = parse_ollama_host(env.get("OLLAMA_HOST"))
+        if wait_for_port_state(ollama_host, ollama_port, True, timeout=12.0):
+            return True
+
     ollama_host, ollama_port = parse_ollama_host(env.get("OLLAMA_HOST"))
     if is_port_open(ollama_host, ollama_port):
         return True

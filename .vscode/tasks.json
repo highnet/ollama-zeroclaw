@@ -1,0 +1,29 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "windows-ollama-run-hello",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				"$ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\\Ollama\\ollama.exe'; & $ollamaExe run qwen2.5:1.5b hello"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "wsl-agent-with-tui-session",
+			"type": "shell",
+			"command": "wsl",
+			"args": [
+				"bash",
+				"-lc",
+				"cd /mnt/c/Users/joaqu/ollama-openclaw && OLLAMA_HOST=http://172.19.16.1:11435 zeroclaw agent --config-dir ./.zeroclaw-home --session-state-file ./.runtime/session.json -m hello"
+			],
+			"isBackground": false
+		}
+	]
+}

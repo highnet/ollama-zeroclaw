@@ -40,6 +40,26 @@ export OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 export OLLAMA_WINDOWS_PROXY_PORT="${OLLAMA_WINDOWS_PROXY_PORT:-11435}"
 export ZEROCLAW_MODEL="$(normalize_ollama_model "${ZEROCLAW_MODEL:-${OPENCLAW_MODEL:-qwen2.5:1.5b}}")"
 
+force_windows_ollama_gpu() {
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local script
+    script="$ollamaExe = Join-Path \$env:LOCALAPPDATA 'Programs\\Ollama\\ollama.exe'; "
+    script+="$amdGpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { \$_.Name -match 'AMD|Radeon' } | Select-Object -First 1; "
+    script+="if (-not \$amdGpu -or -not (Test-Path \$ollamaExe)) { exit 1 }; "
+    script+="[System.Environment]::SetEnvironmentVariable('OLLAMA_VULKAN', '1', 'User'); "
+    script+="Get-Process -Name 'ollama' -ErrorAction SilentlyContinue | Stop-Process -Force; "
+    script+="\$deadline = (Get-Date).AddSeconds(15); do { \$listening = Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue; if (-not \$listening) { break }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt \$deadline); "
+    script+="\$serveScript = \"`$env:OLLAMA_HOST = 'http://127.0.0.1:11434'; `$env:OLLAMA_VULKAN = '1'; & '\" + \$ollamaExe.Replace(\"'\", \"''\") + \"' serve\"; "
+    script+="Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', \$serveScript); "
+    script+="\$deadline = (Get-Date).AddSeconds(20); do { \$listening = Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction SilentlyContinue; if (\$listening) { exit 0 }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt \$deadline); "
+    script+="exit 1"
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$script" >/dev/null 2>&1
+}
+
 resolve_windows_ollama_host() {
     local port="${OLLAMA_PORT:-11434}"
     local proxy_port="${OLLAMA_WINDOWS_PROXY_PORT:-11435}"

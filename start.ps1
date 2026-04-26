@@ -29,6 +29,7 @@ function Get-OllamaStartupEnvironment {
             Where-Object { $_.Name -match 'AMD|Radeon' } |
             Select-Object -First 1
         if ($amdGpu) {
+            [System.Environment]::SetEnvironmentVariable('OLLAMA_VULKAN', '1', 'User')
             $envOverrides['OLLAMA_VULKAN'] = '1'
         }
     } catch {
@@ -38,16 +39,21 @@ function Get-OllamaStartupEnvironment {
 }
 
 function Start-OllamaProcess([string]$OllamaExe, [hashtable]$EnvironmentOverrides) {
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $OllamaExe
-    $startInfo.UseShellExecute = $false
-    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-
+    $serveScriptParts = @()
     foreach ($entry in $EnvironmentOverrides.GetEnumerator()) {
-        $startInfo.Environment[$entry.Key] = $entry.Value
+        $escapedValue = $entry.Value.Replace("'", "''")
+        $serveScriptParts += "`$env:$($entry.Key) = '$escapedValue'"
     }
 
-    [System.Diagnostics.Process]::Start($startInfo) | Out-Null
+    $escapedExe = $OllamaExe.Replace("'", "''")
+    $serveScriptParts += "& '$escapedExe' serve"
+    $serveScript = $serveScriptParts -join '; '
+
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-Command', $serveScript
+    )
 }
 
 function Stop-WindowsOllama([int]$Port = 11434) {

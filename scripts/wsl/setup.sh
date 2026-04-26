@@ -268,6 +268,8 @@ stop_process_from_pid_file() {
 }
 
 # ── Ollama: prefer Windows GPU instance, fall back to WSL CPU ─────────────────
+force_windows_ollama_gpu >/dev/null 2>&1 || true
+
 if [[ -z "${OLLAMA_HOST:-}" ]] && resolved_ollama_host="$(resolve_windows_ollama_host)"; then
     export OLLAMA_HOST="$resolved_ollama_host"
 fi

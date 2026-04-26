@@ -11,6 +11,8 @@ require_cmd zeroclaw
 write_zeroclaw_config
 stop_legacy_openclaw_if_present
 
+force_windows_ollama_gpu >/dev/null 2>&1 || true
+
 if ! ollama_host_is_reachable; then
     use_local_ollama_host
     start_background_process \
