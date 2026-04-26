@@ -70,7 +70,7 @@ The gateway dashboard is served at `http://localhost:18789/`, and the TUI dashbo
 Edit `.env` in the repo root and set:
 
 ```env
-ZEROCLAY_MODEL=ollama/llama3.2:3b
+ZEROCLAW_MODEL=ollama/llama3.2:3b
 ```
 
 Then rerun:
