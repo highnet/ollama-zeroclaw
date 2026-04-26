@@ -246,14 +246,27 @@ if legacy_channels:
     timeout_match = re.search(r'^message_timeout_secs\s*=\s*(\d+)\s*$', legacy_body, re.MULTILINE)
     cli_value = cli_match.group(1) if cli_match else 'true'
     timeout_value = timeout_match.group(1) if timeout_match else '300'
-    channels_config_block = (
-        '[channels_config]\n'
-        f'cli = {cli_value}\n'
-        f'message_timeout_secs = {timeout_value}\n'
-    )
     if re.search(r'(?m)^\[channels_config\]\s*$', txt):
-        txt = re.sub(r'(?ms)^\[channels_config\]\n.*?(?=^\[|\Z)', channels_config_block, txt, count=1)
+        def merge_channels_config(match):
+            body = match.group(1)
+            if re.search(r'(?m)^cli\s*=\s*', body):
+                body = re.sub(r'(?m)^cli\s*=\s*.*$', f'cli = {cli_value}', body, count=1)
+            else:
+                body = f'cli = {cli_value}\n' + body
+            if re.search(r'(?m)^message_timeout_secs\s*=\s*', body):
+                body = re.sub(r'(?m)^message_timeout_secs\s*=\s*.*$', f'message_timeout_secs = {timeout_value}', body, count=1)
+            else:
+                body = body.rstrip() + f'\nmessage_timeout_secs = {timeout_value}\n'
+            return '[channels_config]\n' + body.rstrip() + '\n'
+
+        txt = re.sub(r'(?ms)^\[channels_config\]\n(.*?)(?=^\[|\Z)', merge_channels_config, txt, count=1)
+        txt = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', '', txt, count=1)
     else:
+        channels_config_block = (
+            '[channels_config]\n'
+            f'cli = {cli_value}\n'
+            f'message_timeout_secs = {timeout_value}\n'
+        )
         txt = re.sub(r'(?ms)^\[channels\]\n.*?(?=^\[|\Z)', channels_config_block, txt, count=1)
 # Insert/update [gateway] section port
 if '[gateway]' not in txt:
